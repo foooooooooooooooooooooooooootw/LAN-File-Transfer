@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import ctypes
 
 # Function to check and install missing dependencies
 def check_and_install(package):
@@ -33,6 +34,27 @@ MULTICAST_PORT = 5004
 BUFFER_SIZE = 1024
 FILE_TRANSFER_PORT = 5001  # Default port for file transfers
 SOCKET_TIMEOUT = None  # Removed timeout for the receiver to wait indefinitely
+
+def is_admin():
+    """Check if the script is running with admin privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def add_firewall_rule(port):
+    """Add a firewall rule to allow inbound traffic on a specified port."""
+    rule_name = f"LAN File Transfer {port}"
+    
+    # Build the netsh command
+    netsh_cmd = f'netsh advfirewall firewall add rule name="{rule_name}" dir=in action=allow protocol=TCP localport={port}'
+    
+    try:
+        # Execute the command to add the firewall rule
+        subprocess.check_call(netsh_cmd, shell=True)
+        print(f"[INFO] Firewall rule added: {rule_name}")
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Failed to add firewall rule: {e}")
 
 
 class FileTransferApp(TkinterDnD.Tk):  # Inherit from TkinterDnD.Tk for drag-and-drop
@@ -336,7 +358,7 @@ class FileTransfer:
     def __init__(self, gui_app, network_type='wired'):
         self.gui_app = gui_app  # Reference to the GUI to update the progress bar and handle transfer
         self.packet_size = 64000 if network_type == 'wired' else 8192  # Packet size based on network type
-        self.buffer_size = 128 * 1024
+        self.buffer_size = 512 * 1024
         self.cancelled = False  # To track if a transfer is cancelled
         self.received_files = {}  # Store received files in memory for now
 
@@ -373,13 +395,13 @@ class FileTransfer:
                         self.gui_app.progress_bar.config(text=f"Receiving file from {addr[0]}")
 
                         # Read the filename from the sender
-                        filename_size = int(conn.recv(16).decode('utf-8'))
+                        filename_size = int(conn.recv(8).decode('utf-8'))
                         filename = conn.recv(filename_size).decode('utf-8')
                         print(f"[DEBUG] Receiving file: {filename}")
 
                         # Read the file size
                         file_size_data = conn.recv(16)
-                        file_size = int(file_size_data.decode('utf-8'))
+                        file_size = int(file_size_data.decode('utf-8'))   
                         print(f"[DEBUG] File size: {file_size} bytes")
 
                         # Store the file content in memory
@@ -390,6 +412,12 @@ class FileTransfer:
 
                         # Receiving the file data
                         while total_bytes < file_size:
+
+                            if self.cancelled:
+                                print("[DEBUG] Transfer cancelled by the user.")
+                                self.gui_app.progress_bar.config(text="Transfer cancelled.")
+                                return  # Exit the thread cleanly if cancelled
+
                             remaining_bytes = file_size - total_bytes
                             chunk = conn.recv(min(self.packet_size, remaining_bytes))
                             if not chunk:
@@ -441,8 +469,8 @@ class FileTransfer:
                         self.gui_app.hide_progress_bar()
         except Exception as e:
             print(f"[ERROR] File reception error: {e}")
+            
             self.gui_app.progress_bar.config(text=f"Error: {e}")
-
 
     def send_file(self, file_path, peer_ip, port=FILE_TRANSFER_PORT):
         """Send a file to the selected peer via TCP with tuned socket options in a separate thread."""
@@ -476,7 +504,7 @@ class FileTransfer:
 
                 # Send the file size
                 file_size = os.path.getsize(file_path)
-                s.sendall(f"{file_size:16d}".encode('utf-8'))  # Send the file size
+                s.sendall(f"{file_size:016d}".encode('utf-8'))  # Send the file size
                 print(f"[DEBUG] Sending file size: {file_size}")
 
                 # Initialize a variable to hold the file data
@@ -505,15 +533,28 @@ class FileTransfer:
                         is_video=True,
                         sent=True
                     )
+                else:
+                     self.gui_app.add_file_to_log(
+                        filename=filename,
+                        file_size=file_size,
+                        file_data=file_data,
+                        is_video=False,
+                        sent=True
+                    )
 
                 # Send the file content
                 total_bytes = 0
                 file_data.seek(0)  # Reset buffer position to start sending file content
                 while chunk := file_data.read(self.packet_size):
+
+                    if self.cancelled:
+                        print("[DEBUG] Transfer cancelled by the user.")
+                        self.gui_app.progress_bar.config(text="Transfer cancelled.")
+                        return  # Exit the thread cleanly if cancelled
+                    
                     s.sendall(chunk)
                     total_bytes += len(chunk)
 
-                   
                     # Calculate transfer speed and remaining time
                     elapsed_time = time.time() - start_time
                     speed = total_bytes / elapsed_time if elapsed_time > 0 else 0
@@ -567,7 +608,25 @@ class FileTransfer:
         """Cancel an ongoing file transfer."""
         print("[DEBUG] Cancelling file transfer...")
         self.cancelled = True
+
+def run_as_admin():
+    """Relaunch the script with admin privileges."""
+    # Relaunch the script using 'runas' for UAC, suppress terminal
+    params = ' '.join(sys.argv)
+    subprocess.run(['powershell', '-Command', f'Start-Process -FilePath "{sys.executable}" -ArgumentList "{params}" -Verb RunAs -WindowStyle Hidden'], shell=True)
+    sys.exit(0)
         
 if __name__ == "__main__":
+    if not is_admin():
+        if "ELEVATED" not in os.environ:
+            # Relaunch with admin privileges (suppress terminal with hidden flag)
+            os.environ["ELEVATED"] = "1"  # Set this variable to avoid loops
+            run_as_admin()
+            sys.exit(0)  # Exit the non-elevated instance
+
+    # Add firewall rule before starting the GUI
+    add_firewall_rule(5001)
+
     app = FileTransferApp()
     app.mainloop()
+
