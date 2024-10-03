@@ -9,7 +9,7 @@ def check_and_install(package):
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
 
 def install_dependencies():
-    packages = ['Pillow', 'tkinterdnd2', 'opencv-python']
+    packages = ['Pillow', 'tkinterdnd2', 'opencv-python','imageio', 'imageio[ffmpeg]']
     for package in packages:
         check_and_install(package)
 
@@ -24,6 +24,8 @@ import socket
 import threading
 import time
 import cv2
+import numpy as np
+import imageio
 
 # Multicast configuration
 MULTICAST_GROUP = '224.1.1.1'
@@ -334,7 +336,7 @@ class FileTransfer:
     def __init__(self, gui_app, network_type='wired'):
         self.gui_app = gui_app  # Reference to the GUI to update the progress bar and handle transfer
         self.packet_size = 64000 if network_type == 'wired' else 8192  # Packet size based on network type
-        self.buffer_size = 512 * 1024 if network_type == 'wired' else 128 * 1024  # Buffer size
+        self.buffer_size = 128 * 1024
         self.cancelled = False  # To track if a transfer is cancelled
         self.received_files = {}  # Store received files in memory for now
 
@@ -348,10 +350,18 @@ class FileTransfer:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.buffer_size)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.buffer_size)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)  # Wait 10 seconds before starting keepalive probes
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # Send keepalive probes every 10 seconds
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
 
                 # Bind and listen for incoming connections
                 s.bind(('0.0.0.0', port))
                 s.listen(1)
+                s.settimeout(None)
+                
                 print(f"[DEBUG] Listening for incoming connections on port {port}")
                 self.gui_app.progress_bar.config(text="Waiting for file...")
 
@@ -363,21 +373,14 @@ class FileTransfer:
                         self.gui_app.progress_bar.config(text=f"Receiving file from {addr[0]}")
 
                         # Read the filename from the sender
-                        filename_size = int(conn.recv(8).decode('utf-8'))
+                        filename_size = int(conn.recv(16).decode('utf-8'))
                         filename = conn.recv(filename_size).decode('utf-8')
                         print(f"[DEBUG] Receiving file: {filename}")
 
                         # Read the file size
-                        file_size_data = conn.recv(8)
+                        file_size_data = conn.recv(16)
                         file_size = int(file_size_data.decode('utf-8'))
                         print(f"[DEBUG] File size: {file_size} bytes")
-
-                        # Read the thumbnail size
-                        thumbnail_size = int(conn.recv(8).decode('utf-8'))
-                        thumbnail_data = conn.recv(thumbnail_size)
-                        # Create an image from the received thumbnail data
-                        thumbnail_image = Image.open(io.BytesIO(thumbnail_data))
-                        thumbnail_image = thumbnail_image.thumbnail((50,50), Image.LANCZOS)
 
                         # Store the file content in memory
                         file_data = io.BytesIO()
@@ -387,7 +390,8 @@ class FileTransfer:
 
                         # Receiving the file data
                         while total_bytes < file_size:
-                            chunk = conn.recv(self.packet_size)
+                            remaining_bytes = file_size - total_bytes
+                            chunk = conn.recv(min(self.packet_size, remaining_bytes))
                             if not chunk:
                                 break
                             file_data.write(chunk)
@@ -398,11 +402,22 @@ class FileTransfer:
                             remaining_time = (file_size - total_bytes) / speed if speed > 0 else 0
 
                             # Update progress on receiver side
-                            progress = (total_bytes / file_size) * 100
+                            progress = min((total_bytes / file_size) * 100, 100)
                             self.gui_app.update_transfer_progress(progress, speed, remaining_time)
 
+                        if total_bytes != file_size:
+                            print(f"[ERROR] File size mismatch: received {total_bytes} bytes, expected {file_size} bytes.")
+                            return
 
                         file_data.seek(0)  # Reset pointer to start of the file
+                        first_bytes = file_data.read(16)  # Read the first 16 bytes to inspect the content
+                        print(f"[DEBUG] First 16 bytes of file: {first_bytes}")
+                        print(f"[DEBUG] Generating thumbnail for {filename}")
+                        thumbnail_image = self.generate_video_thumbnail(file_data)
+                        if thumbnail_image:
+                            print(f"[DEBUG] Thumbnail generated successfully for {filename}")
+                        else:
+                            print(f"[ERROR] Thumbnail generation failed for {filename}")
 
                         if not self.cancelled:
                             self.gui_app.add_file_to_log(
@@ -441,11 +456,17 @@ class FileTransfer:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.buffer_size)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.buffer_size)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)  # Wait 10 seconds before starting keepalive probes
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # Send keepalive probes every 10 seconds
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5) 
 
                 # Connect to the peer
                 print(f"[DEBUG] Attempting to connect to {peer_ip}:{port}")
                 s.connect((peer_ip, port))
                 self.gui_app.progress_bar.config(text=f"Connected to {peer_ip}. Sending {file_path}...")
+                s.settimeout(None)
 
                 # Send the file name first
                 filename = os.path.basename(file_path)  # Get just the filename, not the full path
@@ -455,7 +476,8 @@ class FileTransfer:
 
                 # Send the file size
                 file_size = os.path.getsize(file_path)
-                s.sendall(f"{file_size:08d}".encode('utf-8'))  # Send the file size
+                s.sendall(f"{file_size:16d}".encode('utf-8'))  # Send the file size
+                print(f"[DEBUG] Sending file size: {file_size}")
 
                 # Initialize a variable to hold the file data
                 file_data = io.BytesIO()
@@ -483,22 +505,6 @@ class FileTransfer:
                         is_video=True,
                         sent=True
                     )
-
-                # Generate the thumbnail
-                thumbnail_image = None
-                if self._is_image_file(filename):
-                    thumbnail_image = Image.open(file_path)
-                elif self._is_video_file(filename):
-                    thumbnail_image = self.generate_video_thumbnail(file_data)
-
-                # Send the thumbnail if it exists
-                if thumbnail_image:
-                    thumbnail_io = io.BytesIO()
-                    thumbnail_image.save(thumbnail_io, format='PNG')  # Save thumbnail as PNG
-                    thumbnail_io.seek(0)
-                    thumbnail_size = thumbnail_io.getbuffer().nbytes
-                    s.sendall(f"{thumbnail_size:08d}".encode('utf-8'))  # Send thumbnail size
-                    s.sendall(thumbnail_io.getvalue())  # Send thumbnail data
 
                 # Send the file content
                 total_bytes = 0
@@ -534,22 +540,28 @@ class FileTransfer:
     def generate_video_thumbnail(self, file_data):
         """Generate a thumbnail from a video file."""
         try:
-            # Save video data to a temporary file, as OpenCV needs file-based input
-            temp_video_path = 'temp_video.mp4'
-            with open(temp_video_path, 'wb') as temp_video:
-                temp_video.write(file_data.getvalue())
-            
-            # Now open the temp video using OpenCV
-            cap = cv2.VideoCapture(temp_video_path)
-            success, frame = cap.read()  # Read the first frame
-            if success:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert to RGB
-                image = Image.fromarray(frame_rgb)
-                image.thumbnail((50, 50))
-                return image
+            file_data.seek(0)  
+            video_bytes = file_data.read() 
+
+            # Use imageio to read the video from memory
+            video_reader = imageio.get_reader(video_bytes, 'mp4')  # Specify mp4 format
+
+            # Get video metadata
+            video_duration = video_reader.get_meta_data()['duration']  # Get total video duration in seconds
+
+            # Seek to the middle of the video
+            middle_time = video_duration / 2  # Time in seconds (middle of the video)
+
+            # Get the frame at the middle of the video
+            middle_frame = video_reader.get_data(int(video_reader.get_meta_data()['fps'] * middle_time))
+
+            image = Image.fromarray(middle_frame)
+            image.thumbnail((50, 50))  # Create thumbnail
+            return image
         except Exception as e:
             print(f"[ERROR] Failed to generate video thumbnail: {e}")
             return None
+
 
     def cancel_transfer(self):
         """Cancel an ongoing file transfer."""
