@@ -35,28 +35,6 @@ BUFFER_SIZE = 1024
 FILE_TRANSFER_PORT = 5001  # Default port for file transfers
 SOCKET_TIMEOUT = None  # Removed timeout for the receiver to wait indefinitely
 
-def is_admin():
-    """Check if the script is running with admin privileges."""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-def add_firewall_rule(port):
-    """Add a firewall rule to allow inbound traffic on a specified port."""
-    rule_name = f"LAN File Transfer {port}"
-    
-    # Build the netsh command
-    netsh_cmd = f'netsh advfirewall firewall add rule name="{rule_name}" dir=in action=allow protocol=TCP localport={port}'
-    
-    try:
-        # Execute the command to add the firewall rule
-        subprocess.check_call(netsh_cmd, shell=True)
-        print(f"[INFO] Firewall rule added: {rule_name}")
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to add firewall rule: {e}")
-
-
 class FileTransferApp(TkinterDnD.Tk):  # Inherit from TkinterDnD.Tk for drag-and-drop
     def __init__(self):
         super().__init__()
@@ -609,24 +587,85 @@ class FileTransfer:
         print("[DEBUG] Cancelling file transfer...")
         self.cancelled = True
 
+# Check if we can connect to our own listener on the given port
+def is_port_open(port):
+    try:
+        # Create a test listener on the specified port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(('localhost', port))
+            listener.listen(1)
+            
+            # Try to connect to the listener
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as test_socket:
+                test_socket.settimeout(1)  # Timeout for quick response
+                test_socket.connect(('localhost', port))
+            return True
+    except Exception:
+        return False
+
+# Function to check if script is running with admin privileges
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+# Function to run the script as admin
 def run_as_admin():
-    """Relaunch the script with admin privileges."""
-    # Relaunch the script using 'runas' for UAC, suppress terminal
     params = ' '.join(sys.argv)
     subprocess.run(['powershell', '-Command', f'Start-Process -FilePath "{sys.executable}" -ArgumentList "{params}" -Verb RunAs -WindowStyle Hidden'], shell=True)
     sys.exit(0)
-        
-if __name__ == "__main__":
-    if not is_admin():
-        if "ELEVATED" not in os.environ:
-            # Relaunch with admin privileges (suppress terminal with hidden flag)
-            os.environ["ELEVATED"] = "1"  # Set this variable to avoid loops
-            run_as_admin()
-            sys.exit(0)  # Exit the non-elevated instance
 
-    # Add firewall rule before starting the GUI
-    add_firewall_rule(5001)
+# Function to check if firewall rules for the port exist
+def firewall_rule_exists(port):
+    try:
+        # Use netsh to get all firewall rules and search for the specific port in both inbound and outbound rules
+        output = subprocess.check_output(f'netsh advfirewall firewall show rule name=all', shell=True, text=True)
+        inbound_rule = f'Direction=In' in output and f'LocalPort={port}' in output
+        outbound_rule = f'Direction=Out' in output and f'LocalPort={port}' in output
+
+        return inbound_rule and outbound_rule
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Could not check firewall rules: {e}")
+        return False
+
+# Function to add firewall rules if they do not exist
+def add_firewall_rules(port):
+    rule_name_inbound = f"LAN File Transfer inbound port {port}"
+    rule_name_outbound = f"LAN File Transfer outbound port {port}"
+    try:
+        # Add inbound rule
+        netsh_cmd_inbound = f'netsh advfirewall firewall add rule name="{rule_name_inbound}" dir=in action=allow protocol=TCP localport={port}'
+        subprocess.check_call(netsh_cmd_inbound, shell=True)
+        print(f"[INFO] Inbound firewall rule added: {rule_name_inbound}")
+        
+        # Add outbound rule
+        netsh_cmd_outbound = f'netsh advfirewall firewall add rule name="{rule_name_outbound}" dir=out action=allow protocol=TCP localport={port}'
+        subprocess.check_call(netsh_cmd_outbound, shell=True)
+        print(f"[INFO] Outbound firewall rule added: {rule_name_outbound}")
+    
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Failed to add firewall rules: {e}")
+
+if __name__ == "__main__":
+    PORT = 5001  # Replace with the port number you're using
+
+    if not is_port_open(PORT):
+        print(f"[INFO] Port {PORT} is not open. Checking firewall rules...")
+
+        # Check if we have admin privileges
+        if not is_admin():
+            print("[INFO] Not running as admin. Elevating privileges...")
+            run_as_admin()
+
+        # Now that we are admin, check firewall rules
+        if not firewall_rule_exists(PORT):
+            print(f"[INFO] Firewall rules for port {PORT} do not exist. Adding them...")
+            add_firewall_rules(PORT)
+        else:
+            print(f"[INFO] Firewall rules for port {PORT} already exist.")
+    else:
+        print(f"[INFO] Port {PORT} is already open. No need to modify firewall rules.")
 
     app = FileTransferApp()
     app.mainloop()
-
